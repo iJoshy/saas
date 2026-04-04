@@ -17,7 +17,7 @@ def idea(creds: HTTPAuthorizationCredentials = Depends(clerk_guard)):
     # - Track usage per user
     # - Store generated ideas in a database
     # - Apply user-specific limits or customization
-    # - switch to GPT-5.4-pro
+    # - switch to GPT-5.4-nano
     
     client = OpenAI()
     prompt = [{"role": "user", "content": "Reply with a new business idea for AI Agents, formatted with headings, sub-headings and bullet points"}]
