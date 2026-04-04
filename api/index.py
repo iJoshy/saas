@@ -3,7 +3,7 @@ from fastapi import FastAPI, Depends  # type: ignore
 from fastapi.responses import StreamingResponse  # type: ignore
 from pydantic import BaseModel  # type: ignore
 from fastapi_clerk_auth import ClerkConfig, ClerkHTTPBearer, HTTPAuthorizationCredentials  # type: ignore
-from openai import OpenAI  # type: ignore GPT-5.4-nano
+from openai import OpenAI  # type: ignore 
 
 app = FastAPI()
 clerk_config = ClerkConfig(jwks_url=os.getenv("CLERK_JWKS_URL"))
@@ -49,6 +49,7 @@ def consultation_summary(
         {"role": "user", "content": user_prompt},
     ]
 
+    # GPT-5.4-nano
     stream = client.chat.completions.create(
         model="gpt-5.4-nano",
         messages=prompt,
