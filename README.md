@@ -1,4 +1,8 @@
-# MediNotes Consultation Studio
+<div align="center">
+ <h1> MediNotes Consultation Studio </h1>
+</div>
+
+<br/>
 
 <div align="center">
   <strong>AI-powered consultation documentation for modern healthcare teams.</strong>
@@ -24,6 +28,9 @@
 ## Overview
 
 MediNotes Consultation Studio is a healthcare-focused SaaS application that helps clinicians reduce documentation overhead while maintaining professional, consistent, and patient-friendly communication.
+
+<img width="1453" height="600" alt="Screenshot 2026-04-06 at 12 05 15 AM" src="https://github.com/user-attachments/assets/5a0c2aa1-27ef-4532-b1ad-73c1c09f2967" />
+
 
 The app provides an end-to-end workflow:
 
@@ -67,15 +74,6 @@ The app provides an end-to-end workflow:
   - Saved timestamp display.
   - Reloading previous consultations into the editor.
 
-## Demo Screenshots
-
-Add your product visuals here to showcase the experience.
-
-```md
-![Landing Page](./docs/screenshots/landing-page.png)
-![Consultation Workspace](./docs/screenshots/consultation-workspace.png)
-![Generated Report](./docs/screenshots/generated-report.png)
-```
 
 ## Architecture
 
