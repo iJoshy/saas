@@ -3,3 +3,4 @@ uvicorn
 openai
 fastapi-clerk-auth
 pydantic
+sendgrid
