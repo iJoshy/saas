@@ -15,6 +15,7 @@ function ConsultationForm() {
     // Form state
     const [patientName, setPatientName] = useState('');
     const [visitDate, setVisitDate] = useState<Date | null>(new Date());
+    const [patientEmail, setPatientEmail] = useState('');
     const [notes, setNotes] = useState('');
 
     // Streaming state
@@ -46,6 +47,7 @@ function ConsultationForm() {
             body: JSON.stringify({
                 patient_name: patientName,
                 date_of_visit: visitDate?.toISOString().slice(0, 10),
+                patient_email: patientEmail,
                 notes,
             }),
             onmessage(ev) {
@@ -85,19 +87,37 @@ function ConsultationForm() {
                     />
                 </div>
 
-                <div className="space-y-2">
-                    <label htmlFor="date" className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                        Date of Visit
-                    </label>
-                    <DatePicker
-                        id="date"
-                        selected={visitDate}
-                        onChange={(d: Date | null) => setVisitDate(d)}
-                        dateFormat="yyyy-MM-dd"
-                        placeholderText="Select date"
-                        required
-                        className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent dark:bg-gray-700 dark:text-white"
-                    />
+                <div className="grid gap-6 md:grid-cols-2">
+                    <div className="space-y-2">
+                        <label htmlFor="date" className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                            Date of Visit
+                        </label>
+                        <DatePicker
+                            id="date"
+                            selected={visitDate}
+                            onChange={(d: Date | null) => setVisitDate(d)}
+                            dateFormat="yyyy-MM-dd"
+                            placeholderText="Select date"
+                            required
+                            className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent dark:bg-gray-700 dark:text-white"
+                        />
+                    </div>
+
+                    <div className="space-y-2">
+                        <label htmlFor="patient-email" className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                            Patient Email
+                        </label>
+                        <input
+                            id="patient-email"
+                            type="email"
+                            required
+                            value={patientEmail}
+                            onChange={(e) => setPatientEmail(e.target.value)}
+                            autoComplete="email"
+                            className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent dark:bg-gray-700 dark:text-white"
+                            placeholder="name@example.com"
+                        />
+                    </div>
                 </div>
 
                 <div className="space-y-2">

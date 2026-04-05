@@ -1,7 +1,7 @@
 import os
 from fastapi import FastAPI, Depends  # type: ignore
 from fastapi.responses import StreamingResponse  # type: ignore
-from pydantic import BaseModel  # type: ignore
+from pydantic import BaseModel, field_validator  # type: ignore
 from fastapi_clerk_auth import ClerkConfig, ClerkHTTPBearer, HTTPAuthorizationCredentials  # type: ignore
 from openai import OpenAI  # type: ignore
 import urllib.request, urllib.parse, urllib.error
@@ -47,19 +47,17 @@ def push(text: str) -> None:
         print(f"Pushover error: {e}")
 
 
-def send_email(body: str):
+def send_email(body: str, recipient_email: str):
     """Send out an email with the given body."""
     emailkey = os.getenv("SENDGRID_API_KEY")
     emailfrom = os.getenv("SENDGRID_SENDER_EMAIL")
-    emailto = os.getenv("RECIPIENT_EMAIL")
-
-    if not emailkey or not emailfrom or not emailto:
-        print("Sendgrid skipped: SENDGRID_API_KEY, SENDGRID_SENDER_EMAIL, or RECIPIENT_EMAIL is missing")
+    if not emailkey or not emailfrom:
+        print("Sendgrid skipped: SENDGRID_API_KEY or SENDGRID_SENDER_EMAIL is missing")
         return {"status": "skipped", "reason": "missing sendgrid env vars"}
 
     sg = sendgrid.SendGridAPIClient(api_key=emailkey)
     from_email = Email(emailfrom)
-    to_email = To(emailto)
+    to_email = To(recipient_email)
     content = Content("text/html", body)
     mail = Mail(from_email, to_email, "Consultation Summary", content).get()
     sg.client.mail.send.post(request_body=mail)
@@ -88,7 +86,16 @@ tools = [{"type": "function", "function": send_email_json}]
 class Visit(BaseModel):
     patient_name: str
     date_of_visit: str
+    patient_email: str
     notes: str
+
+    @field_validator("patient_email")
+    @classmethod
+    def validate_patient_email(cls, value: str) -> str:
+        email = value.strip()
+        if not re.fullmatch(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", email):
+            raise ValueError("patient_email must be a valid email address")
+        return email
 
 
 system_prompt = """
@@ -111,14 +118,13 @@ def user_prompt_for(visit: Visit) -> str:
     return f"""Create the summary, next steps and draft email for:
 Patient Name: {visit.patient_name}
 Date of Visit: {visit.date_of_visit}
+Patient Email: {visit.patient_email}
 Notes:
 {visit.notes}"""
 
 
-def run_with_tools(client: OpenAI, messages):
+def run_with_tools(client: OpenAI, messages, recipient_email: str):
     """Run chat completions and execute tool calls until the model returns final text."""
-    tool_map = {"send_email": send_email}
-
     for _ in range(5):
         completion = client.chat.completions.create(
             model="gpt-5.4-nano",
@@ -161,11 +167,13 @@ def run_with_tools(client: OpenAI, messages):
             except json.JSONDecodeError:
                 arguments = {}
 
-            tool_fn = tool_map.get(tool_name)
-            if not tool_fn:
+            if tool_name != "send_email":
                 result = {"status": "error", "error": f"Unknown tool: {tool_name}"}
             else:
-                result = tool_fn(**arguments)
+                result = send_email(
+                    body=arguments.get("body", ""),
+                    recipient_email=recipient_email,
+                )
 
             messages.append(
                 {
@@ -209,7 +217,7 @@ def consultation_summary(
         {"role": "user", "content": user_prompt},
     ]
 
-    final_text = run_with_tools(client, messages)
+    final_text = run_with_tools(client, messages, visit.patient_email)
     stream_text = normalize_stream_text(final_text)
 
     def event_stream():
