@@ -49,7 +49,7 @@ function ConsultationForm() {
                 notes,
             }),
             onmessage(ev) {
-                buffer += ev.data;
+                buffer += `${ev.data}\n`;
                 setOutput(buffer);
             },
             onclose() { 
@@ -125,8 +125,16 @@ function ConsultationForm() {
             </form>
 
             {output && (
-                <section className="mt-8 bg-gray-50 dark:bg-gray-800 rounded-xl shadow-lg p-8">
-                    <div className="markdown-content prose prose-blue dark:prose-invert max-w-none">
+                <section className="mt-8 report-shell rounded-2xl p-6 md:p-10">
+                    <header className="mb-6 border-b border-slate-200 pb-4">
+                        <h2 className="text-2xl md:text-3xl font-semibold tracking-tight text-slate-900">
+                            Consultation Report
+                        </h2>
+                        <p className="mt-1 text-sm text-slate-500">
+                            Structured summary for records, actions, and patient communication
+                        </p>
+                    </header>
+                    <div className="markdown-content max-w-none">
                         <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>
                             {output}
                         </ReactMarkdown>

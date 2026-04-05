@@ -3,11 +3,86 @@ from fastapi import FastAPI, Depends  # type: ignore
 from fastapi.responses import StreamingResponse  # type: ignore
 from pydantic import BaseModel  # type: ignore
 from fastapi_clerk_auth import ClerkConfig, ClerkHTTPBearer, HTTPAuthorizationCredentials  # type: ignore
-from openai import OpenAI  # type: ignore 
+from openai import OpenAI  # type: ignore
+import urllib.request, urllib.parse, urllib.error
+import json
+import re
+import html
+import sendgrid
+from sendgrid.helpers.mail import Mail, Email, To, Content
 
 app = FastAPI()
 clerk_config = ClerkConfig(jwks_url=os.getenv("CLERK_JWKS_URL"))
 clerk_guard = ClerkHTTPBearer(clerk_config)
+
+
+def push(text: str) -> None:
+    token = os.getenv("PUSHOVER_TOKEN")
+    user = os.getenv("PUSHOVER_USER")
+
+    if not token or not user:
+        print("Pushover skipped: PUSHOVER_TOKEN or PUSHOVER_USER is missing")
+        return
+
+    payload = urllib.parse.urlencode(
+        {
+            "token": token,
+            "user": user,
+            "message": text,
+        }
+    ).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.pushover.net/1/messages.json",
+        data=payload,
+        method="POST",
+    )
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            print(f"Pushover status={resp.status}, body={body}")
+    except Exception as e:
+        print(f"Pushover error: {e}")
+
+
+def send_email(body: str):
+    """Send out an email with the given body."""
+    emailkey = os.getenv("SENDGRID_API_KEY")
+    emailfrom = os.getenv("SENDGRID_SENDER_EMAIL")
+    emailto = os.getenv("RECIPIENT_EMAIL")
+
+    if not emailkey or not emailfrom or not emailto:
+        print("Sendgrid skipped: SENDGRID_API_KEY, SENDGRID_SENDER_EMAIL, or RECIPIENT_EMAIL is missing")
+        return {"status": "skipped", "reason": "missing sendgrid env vars"}
+
+    sg = sendgrid.SendGridAPIClient(api_key=emailkey)
+    from_email = Email(emailfrom)
+    to_email = To(emailto)
+    content = Content("text/html", body)
+    mail = Mail(from_email, to_email, "Consultation Summary", content).get()
+    sg.client.mail.send.post(request_body=mail)
+    return {"status": "success"}
+
+
+send_email_json = {
+    "name": "send_email",
+    "description": "Use this tool to send an email to the patient",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "body": {
+                "type": "string",
+                "description": "The body of the email to send to the patient",
+            }
+        },
+        "required": ["body"],
+        "additionalProperties": False,
+    },
+}
+
+tools = [{"type": "function", "function": send_email_json}]
 
 
 class Visit(BaseModel):
@@ -23,6 +98,12 @@ Reply with exactly three sections with the headings:
 ### Summary of visit for the doctor's records
 ### Next steps for the doctor
 ### Draft of email to patient in patient-friendly language
+You are able use the send_email tool to send the email to the patient.
+You should use your tool to send one email, providing the report converted into clean, well presented HTML.
+Important formatting rules:
+- The tool argument `body` must be HTML.
+- Your visible assistant response content must be Markdown only.
+- Never include raw HTML tags in your visible assistant response.
 """
 
 
@@ -32,6 +113,85 @@ Patient Name: {visit.patient_name}
 Date of Visit: {visit.date_of_visit}
 Notes:
 {visit.notes}"""
+
+
+def run_with_tools(client: OpenAI, messages):
+    """Run chat completions and execute tool calls until the model returns final text."""
+    tool_map = {"send_email": send_email}
+
+    for _ in range(5):
+        completion = client.chat.completions.create(
+            model="gpt-5.4-nano",
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            stream=False,
+        )
+
+        choice = completion.choices[0]
+        message = choice.message
+        tool_calls = message.tool_calls or []
+
+        if not tool_calls:
+            return message.content or ""
+
+        assistant_tool_call_message = {
+            "role": "assistant",
+            "content": message.content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in tool_calls
+            ],
+        }
+        messages.append(assistant_tool_call_message)
+
+        for tool_call in tool_calls:
+            tool_name = tool_call.function.name
+            raw_args = tool_call.function.arguments or "{}"
+
+            try:
+                arguments = json.loads(raw_args)
+            except json.JSONDecodeError:
+                arguments = {}
+
+            tool_fn = tool_map.get(tool_name)
+            if not tool_fn:
+                result = {"status": "error", "error": f"Unknown tool: {tool_name}"}
+            else:
+                result = tool_fn(**arguments)
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(result),
+                }
+            )
+
+    return "Unable to complete after multiple tool-call rounds."
+
+
+def normalize_stream_text(text: str) -> str:
+    """Convert accidental HTML in model output into readable markdown-like text."""
+    if not re.search(r"<[a-zA-Z][^>]*>", text):
+        return text
+
+    normalized = text
+    normalized = re.sub(r"(?i)<br\\s*/?>", "\n", normalized)
+    normalized = re.sub(r"(?i)</(p|div|h[1-6])>", "\n\n", normalized)
+    normalized = re.sub(r"(?i)<li[^>]*>", "- ", normalized)
+    normalized = re.sub(r"(?i)</li>", "\n", normalized)
+    normalized = re.sub(r"(?i)<[^>]+>", "", normalized)
+    normalized = html.unescape(normalized)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized).strip()
+    return normalized
 
 
 @app.post("/api")
@@ -44,26 +204,17 @@ def consultation_summary(
 
     user_prompt = user_prompt_for(visit)
 
-    prompt = [
+    messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
 
-    # GPT-5.4-nano
-    stream = client.chat.completions.create(
-        model="gpt-5.4-nano",
-        messages=prompt,
-        stream=True,
-    )
+    final_text = run_with_tools(client, messages)
+    stream_text = normalize_stream_text(final_text)
 
     def event_stream():
-        for chunk in stream:
-            text = chunk.choices[0].delta.content
-            if text:
-                lines = text.split("\n")
-                for line in lines[:-1]:
-                    yield f"data: {line}\n\n"
-                    yield "data:  \n"
-                yield f"data: {lines[-1]}\n\n"
+        for line in stream_text.split("\n"):
+            yield f"data: {line}\n\n"
+        push(f"Summary generated for {visit.patient_name} on {visit.date_of_visit}")
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
