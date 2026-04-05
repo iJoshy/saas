@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, Depends  # type: ignore
+from fastapi import FastAPI, Depends, HTTPException, Query  # type: ignore
 from fastapi.responses import StreamingResponse  # type: ignore
 from pydantic import BaseModel, field_validator  # type: ignore
 from fastapi_clerk_auth import ClerkConfig, ClerkHTTPBearer, HTTPAuthorizationCredentials  # type: ignore
@@ -8,12 +8,163 @@ import urllib.request, urllib.parse, urllib.error
 import json
 import re
 import html
+import sqlite3
 import sendgrid
 from sendgrid.helpers.mail import Mail, Email, To, Content
 
 app = FastAPI()
 clerk_config = ClerkConfig(jwks_url=os.getenv("CLERK_JWKS_URL"))
 clerk_guard = ClerkHTTPBearer(clerk_config)
+HISTORY_DB_PATH = os.getenv("HISTORY_DB_PATH", "consultation_history.db")
+HISTORY_ENABLED = True
+
+
+def _dir_writable(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+        return os.access(path, os.W_OK)
+    except Exception:
+        return False
+
+
+def resolve_history_db_path() -> str:
+    """
+    Prefer an explicit path, but gracefully fall back to /tmp on serverless
+    platforms where the deployment directory is read-only (e.g. /var/task).
+    """
+    configured = (HISTORY_DB_PATH or "").strip()
+    candidates = []
+
+    if configured:
+        if os.path.isabs(configured):
+            candidates.append(configured)
+            candidates.append(os.path.join("/tmp", os.path.basename(configured)))
+        else:
+            candidates.append(os.path.join("/tmp", configured))
+    else:
+        candidates.append("/tmp/consultation_history.db")
+
+    candidates.append("/tmp/consultation_history.db")
+
+    for candidate in candidates:
+        parent = os.path.dirname(candidate) or "."
+        if _dir_writable(parent):
+            return candidate
+
+    return "/tmp/consultation_history.db"
+
+
+def get_db_connection() -> sqlite3.Connection:
+    db_path = resolve_history_db_path()
+    db_dir = os.path.dirname(db_path) or "."
+    os.makedirs(db_dir, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_history_db() -> None:
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS consultation_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                patient_name TEXT NOT NULL,
+                patient_email TEXT NOT NULL,
+                date_of_visit TEXT NOT NULL,
+                notes TEXT NOT NULL,
+                summary_markdown TEXT NOT NULL,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        # Lightweight migration for existing tables created before `pinned` existed.
+        cols = conn.execute("PRAGMA table_info(consultation_history)").fetchall()
+        col_names = {col["name"] for col in cols}
+        if "pinned" not in col_names:
+            conn.execute(
+                "ALTER TABLE consultation_history ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
+            )
+
+
+def save_history_item(
+    user_id: str,
+    patient_name: str,
+    patient_email: str,
+    date_of_visit: str,
+    notes: str,
+    summary_markdown: str,
+) -> int:
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO consultation_history
+                (user_id, patient_name, patient_email, date_of_visit, notes, summary_markdown)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, patient_name, patient_email, date_of_visit, notes, summary_markdown),
+        )
+        return int(cursor.lastrowid)
+
+
+def list_history_items(user_id: str):
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, patient_name, patient_email, date_of_visit, created_at, pinned
+            FROM consultation_history
+            WHERE user_id = ?
+            ORDER BY pinned DESC, id DESC
+            LIMIT 100
+            """,
+            (user_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_history_item(user_id: str, history_id: int):
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id, patient_name, patient_email, date_of_visit, notes, summary_markdown, created_at, pinned
+            FROM consultation_history
+            WHERE user_id = ? AND id = ?
+            """,
+            (user_id, history_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def set_history_pin(user_id: str, history_id: int, pinned: bool):
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE consultation_history
+            SET pinned = ?
+            WHERE user_id = ? AND id = ?
+            """,
+            (1 if pinned else 0, user_id, history_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+        row = conn.execute(
+            """
+            SELECT id, patient_name, patient_email, date_of_visit, created_at, pinned
+            FROM consultation_history
+            WHERE user_id = ? AND id = ?
+            """,
+            (user_id, history_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+try:
+    init_history_db()
+except Exception as e:
+    HISTORY_ENABLED = False
+    print(f"History DB disabled due to initialization error: {e}")
 
 
 def push(text: str) -> None:
@@ -96,6 +247,10 @@ class Visit(BaseModel):
         if not re.fullmatch(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", email):
             raise ValueError("patient_email must be a valid email address")
         return email
+
+
+class PinUpdate(BaseModel):
+    pinned: bool
 
 
 system_prompt = """
@@ -219,10 +374,122 @@ def consultation_summary(
 
     final_text = run_with_tools(client, messages, visit.patient_email)
     stream_text = normalize_stream_text(final_text)
+    history_id = None
+    if HISTORY_ENABLED:
+        try:
+            history_id = save_history_item(
+                user_id=user_id,
+                patient_name=visit.patient_name,
+                patient_email=visit.patient_email,
+                date_of_visit=visit.date_of_visit,
+                notes=visit.notes,
+                summary_markdown=stream_text,
+            )
+        except Exception as e:
+            print(f"History save error: {e}")
 
     def event_stream():
+        if history_id is not None:
+            print(f"Saved consultation history id={history_id} for user={user_id}")
         for line in stream_text.split("\n"):
             yield f"data: {line}\n\n"
         push(f"Summary generated for {visit.patient_name} on {visit.date_of_visit}")
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/api/history")
+@app.get("/history")
+def consultation_history(
+    creds: HTTPAuthorizationCredentials = Depends(clerk_guard),
+):
+    if not HISTORY_ENABLED:
+        return {"items": []}
+    user_id = creds.decoded["sub"]
+    return {"items": list_history_items(user_id)}
+
+
+@app.get("/api")
+def consultation_history_compat(
+    action: str = Query(default="none"),
+    history_id: int = Query(default=0),
+    creds: HTTPAuthorizationCredentials = Depends(clerk_guard),
+):
+    """
+    Compatibility endpoint for deployments where /api/history subpaths are not routed
+    to this ASGI app. Use /api?action=history|detail.
+    """
+    user_id = creds.decoded["sub"]
+
+    if action == "history":
+        if not HISTORY_ENABLED:
+            return {"items": []}
+        return {"items": list_history_items(user_id)}
+
+    if action == "detail":
+        if not HISTORY_ENABLED:
+            raise HTTPException(status_code=503, detail="History service unavailable")
+        if history_id <= 0:
+            raise HTTPException(status_code=400, detail="history_id is required")
+        item = get_history_item(user_id, history_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="History item not found")
+        return item
+
+    raise HTTPException(status_code=400, detail="Invalid action")
+
+
+@app.get("/api/history/{history_id}")
+@app.get("/history/{history_id}")
+def consultation_history_detail(
+    history_id: int,
+    creds: HTTPAuthorizationCredentials = Depends(clerk_guard),
+):
+    if not HISTORY_ENABLED:
+        raise HTTPException(status_code=503, detail="History service unavailable")
+    user_id = creds.decoded["sub"]
+    item = get_history_item(user_id, history_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="History item not found")
+    return item
+
+
+@app.patch("/api/history/{history_id}/pin")
+@app.patch("/history/{history_id}/pin")
+def consultation_history_pin(
+    history_id: int,
+    payload: PinUpdate,
+    creds: HTTPAuthorizationCredentials = Depends(clerk_guard),
+):
+    if not HISTORY_ENABLED:
+        raise HTTPException(status_code=503, detail="History service unavailable")
+    user_id = creds.decoded["sub"]
+    updated = set_history_pin(user_id, history_id, payload.pinned)
+    if not updated:
+        raise HTTPException(status_code=404, detail="History item not found")
+    return updated
+
+
+@app.patch("/api")
+def consultation_history_pin_compat(
+    payload: PinUpdate,
+    action: str = Query(default="none"),
+    history_id: int = Query(default=0),
+    creds: HTTPAuthorizationCredentials = Depends(clerk_guard),
+):
+    """
+    Compatibility endpoint for deployments where /api/history/{id}/pin is not routed.
+    Use /api?action=pin&history_id=<id>.
+    """
+    if action != "pin":
+        raise HTTPException(status_code=400, detail="Invalid action")
+    if not HISTORY_ENABLED:
+        raise HTTPException(status_code=503, detail="History service unavailable")
+    if history_id <= 0:
+        raise HTTPException(status_code=400, detail="history_id is required")
+
+    user_id = creds.decoded["sub"]
+    updated = set_history_pin(user_id, history_id, payload.pinned)
+    if not updated:
+        raise HTTPException(status_code=404, detail="History item not found")
+    return updated
