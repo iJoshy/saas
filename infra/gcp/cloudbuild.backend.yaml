@@ -1,0 +1,15 @@
+substitutions:
+  _IMAGE: europe-west1-docker.pkg.dev/$PROJECT_ID/medinotes/medinotes-backend:manual
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - backend/Dockerfile
+      - -t
+      - ${_IMAGE}
+      - .
+
+images:
+  - ${_IMAGE}

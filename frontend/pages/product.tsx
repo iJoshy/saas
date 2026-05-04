@@ -1,12 +1,11 @@
 "use client"
 
-import { useState, FormEvent, useCallback, useEffect } from 'react';
+import { useState, FormEvent, useCallback, useEffect, useRef } from 'react';
 import { useAuth } from '@clerk/nextjs';
 import DatePicker from 'react-datepicker';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
-import { fetchEventSource } from '@microsoft/fetch-event-source';
 import { Protect, PricingTable, UserButton } from '@clerk/nextjs';
 
 type HistoryListItem = {
@@ -23,6 +22,13 @@ type HistoryDetail = HistoryListItem & {
     summary_markdown: string;
 };
 
+const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL ?? '').replace(/\/$/, '');
+
+function apiUrl(path: string): string {
+    if (/^https?:\/\//.test(path)) return path;
+    return `${API_BASE_URL}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
 function formatTimestamp(value: string): string {
     const parsed = new Date(value);
     if (Number.isNaN(parsed.getTime())) return value;
@@ -32,7 +38,7 @@ function formatTimestamp(value: string): string {
 async function fetchWithFallback(paths: string[], init?: RequestInit): Promise<Response> {
     let lastResponse: Response | null = null;
     for (const path of paths) {
-        const res = await fetch(path, init);
+        const res = await fetch(apiUrl(path), init);
         lastResponse = res;
         if (res.ok) return res;
         // Try alternate route only for likely routing mismatches.
@@ -42,8 +48,39 @@ async function fetchWithFallback(paths: string[], init?: RequestInit): Promise<R
     throw new Error('No response from history endpoint');
 }
 
+function appendSseEvent(eventText: string, currentOutput: string): string {
+    const dataLines = eventText
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.replace(/^data:\s?/, ''));
+
+    if (dataLines.length === 0) return currentOutput;
+    return `${currentOutput}${dataLines.join('\n')}\n`;
+}
+
+function looksLikeEmailStatus(text: string): boolean {
+    const normalized = text.toLowerCase();
+    return (
+        normalized.includes('email has been sent') ||
+        normalized.includes("i've sent") ||
+        normalized.includes('i have sent') ||
+        normalized.includes('sent an email') ||
+        normalized.includes('the email has been sent')
+    );
+}
+
+function looksLikeClinicalReport(text: string): boolean {
+    const normalized = text.toLowerCase();
+    return (
+        normalized.includes("summary of visit for the doctor's records") &&
+        normalized.includes('next steps for the doctor') &&
+        normalized.includes('draft of email to patient')
+    );
+}
+
 function ConsultationWorkspace() {
     const { getToken } = useAuth();
+    const reportRef = useRef<HTMLElement | null>(null);
 
     const [patientName, setPatientName] = useState('');
     const [visitDate, setVisitDate] = useState<Date | null>(new Date());
@@ -60,6 +97,7 @@ function ConsultationWorkspace() {
     const [drawerOpen, setDrawerOpen] = useState(false);
     const [historyQuery, setHistoryQuery] = useState('');
     const [showPinnedOnly, setShowPinnedOnly] = useState(false);
+    const showReportPanel = loading || Boolean(output);
 
     const loadHistory = useCallback(async () => {
         setHistoryLoading(true);
@@ -138,6 +176,11 @@ function ConsultationWorkspace() {
         void loadHistory();
     }, [loadHistory]);
 
+    useEffect(() => {
+        if (!showReportPanel) return;
+        reportRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, [showReportPanel]);
+
     async function togglePin(item: HistoryListItem) {
         try {
             const jwt = await getToken();
@@ -192,36 +235,99 @@ function ConsultationWorkspace() {
             return;
         }
 
-        const controller = new AbortController();
         let buffer = '';
+        let pending = '';
 
-        await fetchEventSource('/api/consultation', {
-            signal: controller.signal,
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${jwt}`,
-            },
-            body: JSON.stringify({
-                patient_name: patientName,
-                date_of_visit: visitDate?.toISOString().slice(0, 10),
-                patient_email: patientEmail,
-                notes,
-            }),
-            onmessage(ev) {
-                buffer += `${ev.data}\n`;
-                setOutput(buffer);
-            },
-            onclose() {
-                setLoading(false);
-                void loadHistory();
-            },
-            onerror(err) {
-                console.error('SSE error:', err);
-                controller.abort();
-                setLoading(false);
-            },
-        });
+        async function loadLatestGeneratedReport() {
+            const latestRes = await fetchWithFallback(['/api?action=history', '/api/history', '/history'], {
+                headers: {
+                    Authorization: `Bearer ${jwt}`,
+                },
+            });
+
+            if (!latestRes.ok) return false;
+
+            const latestData = (await latestRes.json()) as { items?: HistoryListItem[] };
+            const latestItem = latestData.items?.[0];
+            if (!latestItem) return false;
+
+            await loadHistoryDetail(latestItem.id);
+            return true;
+        }
+
+        try {
+            const res = await fetch(apiUrl('/api/consultation'), {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${jwt}`,
+                },
+                body: JSON.stringify({
+                    patient_name: patientName,
+                    date_of_visit: visitDate?.toISOString().slice(0, 10),
+                    patient_email: patientEmail,
+                    notes,
+                }),
+            });
+
+            if (!res.ok) {
+                const errorBody = await res.text();
+                throw new Error(`Consultation request failed with status ${res.status}: ${errorBody}`);
+            }
+
+            if (!res.body) {
+                const text = await res.text();
+                buffer = text;
+                setOutput(text);
+                return;
+            }
+
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+
+                pending += decoder.decode(value, { stream: true });
+                const events = pending.split(/\r?\n\r?\n/);
+                pending = events.pop() ?? '';
+
+                for (const eventText of events) {
+                    buffer = appendSseEvent(eventText, buffer);
+                    if (buffer.trim()) setOutput(buffer);
+                }
+            }
+
+            pending += decoder.decode();
+            if (pending.trim()) {
+                buffer = appendSseEvent(pending, buffer);
+                if (buffer.trim()) setOutput(buffer);
+            }
+
+            if (looksLikeEmailStatus(buffer)) {
+                const loadedFromHistory = await loadLatestGeneratedReport();
+                if (!loadedFromHistory) {
+                    setOutput('The backend returned an email delivery status instead of the consultation report. Please redeploy the backend and try again.');
+                }
+            } else if (!buffer.trim()) {
+                const loadedFromHistory = await loadLatestGeneratedReport();
+                if (!loadedFromHistory) {
+                    setOutput('The consultation was generated, but no report text was returned. Open the latest history item to view it.');
+                }
+            } else if (!looksLikeClinicalReport(buffer)) {
+                console.warn('Consultation response did not match expected report shape:', buffer);
+            }
+        } catch (error) {
+            console.error('Consultation request error:', error);
+            const loadedFromHistory = await loadLatestGeneratedReport().catch(() => false);
+            if (!loadedFromHistory) {
+                setOutput('Unable to display the consultation report. Please try again or open the latest item in history.');
+            }
+        } finally {
+            setLoading(false);
+            void loadHistory();
+        }
     }
 
     const filteredHistoryItems = historyItems.filter((item) => {
@@ -443,8 +549,8 @@ function ConsultationWorkspace() {
                         </button>
                     </form>
 
-                    {output && (
-                        <section className="report-shell fade-in-up mt-8 rounded-3xl p-6 md:p-10">
+                    {showReportPanel && (
+                        <section ref={reportRef} className="report-shell fade-in-up mt-8 rounded-3xl p-6 md:p-10">
                             <header className="mb-7 border-b border-slate-200/80 pb-4">
                                 <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Output</p>
                                 <h2 className="mt-1 text-2xl font-semibold tracking-tight text-slate-900 md:text-3xl">
@@ -455,7 +561,11 @@ function ConsultationWorkspace() {
                                 </p>
                             </header>
                             <div className="markdown-content max-w-none">
-                                <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>{output}</ReactMarkdown>
+                                {output ? (
+                                    <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>{output}</ReactMarkdown>
+                                ) : (
+                                    <p>Generating consultation report...</p>
+                                )}
                             </div>
                         </section>
                     )}

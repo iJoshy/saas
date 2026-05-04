@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-openai
+google-genai
 fastapi-clerk-auth
 pydantic
 sendgrid

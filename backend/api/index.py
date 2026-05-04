@@ -1,14 +1,11 @@
 import os
-from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException, Query  # type: ignore
+from fastapi.responses import StreamingResponse  # type: ignore
 from pydantic import BaseModel, field_validator  # type: ignore
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
 from fastapi_clerk_auth import ClerkConfig, ClerkHTTPBearer, HTTPAuthorizationCredentials  # type: ignore
-from openai import OpenAI  # type: ignore
+from google import genai  # type: ignore
+from google.genai import types  # type: ignore
 import urllib.request, urllib.parse, urllib.error
-import json
 import re
 import html
 import sqlite3
@@ -16,20 +13,11 @@ import sendgrid
 from sendgrid.helpers.mail import Mail, Email, To, Content
 
 app = FastAPI()
-
-# Add CORS middleware (allows frontend to call backend)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 clerk_config = ClerkConfig(jwks_url=os.getenv("CLERK_JWKS_URL"))
 clerk_guard = ClerkHTTPBearer(clerk_config)
 HISTORY_DB_PATH = os.getenv("HISTORY_DB_PATH", "consultation_history.db")
 HISTORY_ENABLED = True
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 
 def _dir_writable(path: str) -> bool:
@@ -228,25 +216,6 @@ def send_email(body: str, recipient_email: str):
     return {"status": "success"}
 
 
-send_email_json = {
-    "name": "send_email",
-    "description": "Use this tool to send an email to the patient",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "body": {
-                "type": "string",
-                "description": "The body of the email to send to the patient",
-            }
-        },
-        "required": ["body"],
-        "additionalProperties": False,
-    },
-}
-
-tools = [{"type": "function", "function": send_email_json}]
-
-
 class Visit(BaseModel):
     patient_name: str
     date_of_visit: str
@@ -267,23 +236,49 @@ class PinUpdate(BaseModel):
 
 
 system_prompt = """
-You are provided with notes written by a doctor from a patient's visit.
-Your job is to summarize the visit for the doctor and provide an email.
-Reply with exactly three sections with the headings:
+You are a clinical documentation assistant for a doctor.
+Use only the visit notes provided by the doctor. Do not invent diagnoses, medications, test results, or follow-up details.
+If a diagnosis or clinical impression is not stated in the notes, say "Not specified in the notes."
+
+Your output is the consultation report that will be shown directly in the browser.
+Reply with exactly three Markdown sections with these exact headings:
 ### Summary of visit for the doctor's records
 ### Next steps for the doctor
 ### Draft of email to patient in patient-friendly language
-You are able use the send_email tool to send the email to the patient.
-You should use your tool to send one email, providing the report converted into clean, well presented HTML.
+
+Content requirements:
+- In the summary, include the diagnosis, assessment, or clinical impression when it is present in the notes.
+- In the next steps, list concrete clinician actions and follow-up items from the notes.
+- In the draft email, write patient-friendly language that can be sent to the patient.
+
 Important formatting rules:
-- The tool argument `body` must be HTML.
-- Your visible assistant response content must be Markdown only.
+- Your response content must be Markdown only.
 - Never include raw HTML tags in your visible assistant response.
+- Do not say that an email was sent.
+- Do not write a status update, confirmation, or notification.
+- Do not mention tools, sending, delivery, or notifications.
+- The application will send the generated draft after your report is returned.
 """
+
+required_report_headings = [
+    "### Summary of visit for the doctor's records",
+    "### Next steps for the doctor",
+    "### Draft of email to patient in patient-friendly language",
+]
+
+invalid_report_phrases = [
+    "i've sent",
+    "i have sent",
+    "email has been sent",
+    "email was sent",
+    "sent an email",
+    "i sent",
+    "notification",
+]
 
 
 def user_prompt_for(visit: Visit) -> str:
-    return f"""Create the summary, next steps and draft email for:
+    return f"""Create the browser-visible consultation report for:
 Patient Name: {visit.patient_name}
 Date of Visit: {visit.date_of_visit}
 Patient Email: {visit.patient_email}
@@ -291,67 +286,100 @@ Notes:
 {visit.notes}"""
 
 
-def run_with_tools(client: OpenAI, messages, recipient_email: str):
-    """Run chat completions and execute tool calls until the model returns final text."""
-    for _ in range(5):
-        completion = client.chat.completions.create(
-            model="gpt-5.4-nano",
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-            stream=False,
-        )
+def is_valid_report(text: str) -> bool:
+    normalized = text.strip().lower()
+    if not normalized:
+        return False
+    if any(phrase in normalized for phrase in invalid_report_phrases):
+        return False
+    return all(heading.lower() in normalized for heading in required_report_headings)
 
-        choice = completion.choices[0]
-        message = choice.message
-        tool_calls = message.tool_calls or []
 
-        if not tool_calls:
-            return message.content or ""
+def make_gemini_client() -> genai.Client:
+    """Use Vertex AI on GCP, or GEMINI_API_KEY for local development."""
+    use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if use_vertex:
+        project = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT_ID")
+        location = os.getenv("GOOGLE_CLOUD_LOCATION") or os.getenv("GCP_REGION") or "global"
+        return genai.Client(vertexai=True, project=project, location=location)
 
-        assistant_tool_call_message = {
-            "role": "assistant",
-            "content": message.content or "",
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in tool_calls
-            ],
-        }
-        messages.append(assistant_tool_call_message)
+    return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-        for tool_call in tool_calls:
-            tool_name = tool_call.function.name
-            raw_args = tool_call.function.arguments or "{}"
 
-            try:
-                arguments = json.loads(raw_args)
-            except json.JSONDecodeError:
-                arguments = {}
+def generate_report(client: genai.Client, visit: Visit) -> str:
+    """Generate the Markdown report that is shown on-screen and stored."""
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=user_prompt_for(visit),
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0.2,
+        ),
+    )
 
-            if tool_name != "send_email":
-                result = {"status": "error", "error": f"Unknown tool: {tool_name}"}
-            else:
-                result = send_email(
-                    body=arguments.get("body", ""),
-                    recipient_email=recipient_email,
-                )
+    report = response.text or ""
+    if is_valid_report(report):
+        return report
 
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": json.dumps(result),
-                }
-            )
+    print(f"Gemini returned invalid report shape, retrying. First response: {report!r}")
+    retry_response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=f"""{user_prompt_for(visit)}
 
-    return "Unable to complete after multiple tool-call rounds."
+Your previous response was not acceptable because it did not contain the browser-visible consultation report.
+Return only the three required Markdown sections with the exact headings. Do not say that an email was sent.
+""",
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0.1,
+        ),
+    )
+
+    return retry_response.text or ""
+
+
+def report_to_email_html(report_markdown: str) -> str:
+    """Convert the generated Markdown report into simple, readable email HTML."""
+    html_parts = [
+        "<html><body style=\"font-family: Arial, sans-serif; line-height: 1.6; color: #0f172a;\">"
+    ]
+    in_list = False
+
+    for raw_line in report_markdown.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            continue
+
+        escaped = html.escape(line.lstrip("#").strip())
+
+        if line.startswith("### "):
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            html_parts.append(f"<h2 style=\"margin-top: 24px; color: #0f172a;\">{escaped}</h2>")
+        elif line.startswith("- "):
+            if not in_list:
+                html_parts.append("<ul>")
+                in_list = True
+            html_parts.append(f"<li>{html.escape(line[2:].strip())}</li>")
+        else:
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            html_parts.append(f"<p>{html.escape(line)}</p>")
+
+    if in_list:
+        html_parts.append("</ul>")
+
+    html_parts.append("</body></html>")
+    return "".join(html_parts)
 
 
 def normalize_stream_text(text: str) -> str:
@@ -370,23 +398,29 @@ def normalize_stream_text(text: str) -> str:
     return normalized
 
 
-@app.post("/api/consultation")
+@app.post("/api")
 def consultation_summary(
     visit: Visit,
     creds: HTTPAuthorizationCredentials = Depends(clerk_guard),
 ):
     user_id = creds.decoded["sub"]  # Available for tracking/auditing
-    client = OpenAI()
+    client = make_gemini_client()
 
-    user_prompt = user_prompt_for(visit)
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-
-    final_text = run_with_tools(client, messages, visit.patient_email)
+    final_text = generate_report(client, visit)
     stream_text = normalize_stream_text(final_text)
+    if not is_valid_report(stream_text):
+        print(f"Gemini failed to return a valid consultation report: {stream_text!r}")
+        raise HTTPException(
+            status_code=502,
+            detail="The AI model did not return a valid consultation report. Please try again.",
+        )
+
+    try:
+        email_result = send_email(report_to_email_html(stream_text), visit.patient_email)
+        print(f"SendGrid result for {visit.patient_email}: {email_result}")
+    except Exception as e:
+        print(f"SendGrid error: {e}")
+
     history_id = None
     if HISTORY_ENABLED:
         try:
@@ -506,20 +540,3 @@ def consultation_history_pin_compat(
     if not updated:
         raise HTTPException(status_code=404, detail="History item not found")
     return updated
-
-
-@app.get("/health")
-def health_check():
-    """Health check endpoint for AWS App Runner"""
-    return {"status": "healthy"}
-
-# Serve static files (our Next.js export) - MUST BE LAST!
-static_path = Path("static")
-if static_path.exists():
-    # Serve index.html for the root path
-    @app.get("/")
-    async def serve_root():
-        return FileResponse(static_path / "index.html")
-    
-    # Mount static files for all other routes
-    app.mount("/", StaticFiles(directory="static", html=True), name="static")
