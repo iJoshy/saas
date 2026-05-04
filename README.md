@@ -9,7 +9,7 @@
   <br />
   Turn raw clinical notes into structured summaries, clear next steps, and patient-friendly email drafts in minutes.
   <br />
-  <a href="https://myziq7veyx.eu-west-1.awsapprunner.com/"><strong>Live Production App</strong></a>
+  <a href="https://medinotes-studio.web.app/"><strong>Live Production App</strong></a>
 </div>
 
 <br />
@@ -21,7 +21,7 @@
 ![TypeScript](https://img.shields.io/badge/TypeScript-Frontend-3178C6?logo=typescript)
 ![Python](https://img.shields.io/badge/Python-API-3776AB?logo=python)
 ![Clerk](https://img.shields.io/badge/Auth-Clerk-6C47FF)
-![OpenAI](https://img.shields.io/badge/AI-OpenAI-412991?logo=openai)
+![Gemini](https://img.shields.io/badge/AI-Gemini_2.5_Flash-4285F4)
 
 </div>
 
@@ -41,7 +41,7 @@ The app provides an end-to-end workflow:
 
 ## Core Features
 
-- AI consultation report generation using OpenAI.
+- AI consultation report generation using Gemini 2.5 Flash.
 - Structured output with three sections:
   - Summary for clinical records.
   - Next steps for provider action.
@@ -83,7 +83,7 @@ Frontend (Next.js / React / TypeScript)
 
 Backend (FastAPI / Python)
   -> Auth guard (Clerk JWT)
-  -> OpenAI completion + tool-call loop
+  -> Gemini 2.5 Flash + email tool calling
   -> SendGrid email send
   -> SQLite history persistence
   -> Pushover notification
@@ -92,8 +92,8 @@ Backend (FastAPI / Python)
 ### Key Technical Decisions
 
 - Dual backend entry points:
-  - `api/index.py`: serverless/API route deployments.
-  - `api/server.py`: containerized deployment with static file serving.
+  - `backend/api/index.py`: serverless/API route deployments.
+  - `backend/api/server.py`: containerized deployment.
 - Route compatibility fallbacks:
   - Supports both RESTful history routes and query-based compatibility routes (`/api?action=...`) for environments where subpath routing differs.
 - Resilient history DB path resolution:
@@ -115,7 +115,7 @@ Backend (FastAPI / Python)
 
 - FastAPI
 - Uvicorn
-- OpenAI Python SDK
+- Google Gen AI Python SDK
 - `fastapi-clerk-auth`
 - SendGrid SDK
 - SQLite (`sqlite3`)
@@ -124,31 +124,39 @@ Backend (FastAPI / Python)
 
 ```text
 .
-├── api/
-│   ├── index.py          # Serverless-focused backend entry
-│   └── server.py         # Container backend + static serving
-├── pages/
-│   ├── index.tsx         # Landing page
-│   ├── product.tsx       # Protected product workspace
-│   ├── _app.tsx          # Global providers (Clerk)
-│   └── _document.tsx
-├── styles/
-│   └── globals.css       # Tailwind + custom UI system
-├── public/
-├── Dockerfile
-├── requirements.txt
-└── package.json
+├── backend/
+│   ├── api/
+│   │   ├── index.py      # Serverless-focused backend entry
+│   │   └── server.py     # Container backend entry
+│   ├── Dockerfile
+│   └── requirements.txt
+├── frontend/
+│   ├── pages/
+│   ├── public/
+│   ├── styles/
+│   ├── firebase.json
+│   └── package.json
+├── database/
+│   └── consultation_history.sql
+├── infra/
+│   ├── aws/
+│   ├── gcp/
+│   └── scripts/
+└── docs/
+    └── MIGRATION.md
 ```
 
 ## Environment Variables
 
-Create `.env.local` (frontend) and `.env` (backend/runtime) as needed.
+Keep deployment/runtime values in the repo-root `.env`. For local frontend-only development, either export the `NEXT_PUBLIC_*` values in your shell or create `frontend/.env.local`.
 
 ### Required
 
-- `OPENAI_API_KEY`
+- `GEMINI_API_KEY` (local/non-GCP development) or Vertex AI auth on GCP
+- `GEMINI_MODEL` (defaults to `gemini-2.5-flash`)
 - `CLERK_JWKS_URL`
 - `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
+- `NEXT_PUBLIC_API_BASE_URL` (Firebase Hosting -> Cloud Run URL)
 - `CLERK_SECRET_KEY`
 
 ### Optional but Recommended
@@ -163,6 +171,9 @@ Create `.env.local` (frontend) and `.env` (backend/runtime) as needed.
 
 - `AWS_ACCOUNT_ID`
 - `DEFAULT_AWS_REGION`
+- `GCP_PROJECT_ID`
+- `GCP_REGION`
+- `FIREBASE_PROJECT_ID`
 - `VERCEL_OIDC_TOKEN`
 
 ## Local Development
@@ -170,18 +181,26 @@ Create `.env.local` (frontend) and `.env` (backend/runtime) as needed.
 ### 1. Install dependencies
 
 ```bash
-npm install
-pip install -r requirements.txt
+npm --prefix frontend install
+pip install -r backend/requirements.txt
 ```
 
 ### 2. Configure environment
 
 Set env vars in `.env.local` and `.env`.
 
+When running from shell, you can load the root `.env` first:
+
+```bash
+set -a
+source .env
+set +a
+```
+
 ### 3. Run frontend
 
 ```bash
-npm run dev
+npm --prefix frontend run dev
 ```
 
 Frontend runs at:
@@ -191,6 +210,7 @@ Frontend runs at:
 ### 4. Run backend (FastAPI)
 
 ```bash
+cd backend
 uvicorn api.server:app --reload --port 8000
 ```
 
@@ -200,35 +220,31 @@ Backend runs at:
 
 ## Docker Deployment
 
-This repo includes a multi-stage Docker build:
-
-1. Build Next.js frontend.
-2. Install Python backend.
-3. Serve API + static frontend from FastAPI on port `8000`.
+This repo includes a backend-only Docker build for Cloud Run or App Runner.
 
 ### Build
 
 ```bash
-docker build \
-  --build-arg NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=<your_public_key> \
-  -t medinotes:latest .
+docker build -f backend/Dockerfile -t medinotes-backend:latest .
 ```
 
 ### Run
 
 ```bash
 docker run --rm -p 8000:8000 \
-  -e OPENAI_API_KEY=<your_openai_key> \
+  -e GEMINI_API_KEY=<your_gemini_key> \
   -e CLERK_JWKS_URL=<your_clerk_jwks_url> \
   -e CLERK_SECRET_KEY=<your_clerk_secret_key> \
   -e SENDGRID_API_KEY=<optional> \
   -e SENDGRID_SENDER_EMAIL=<optional> \
-  medinotes:latest
+  medinotes-backend:latest
 ```
 
 Current production deployment:
 
-- https://myziq7veyx.eu-west-1.awsapprunner.com/
+- https://medinotes-studio.web.app/
+
+GCP migration notes and Terraform live in [`docs/MIGRATION.md`](docs/MIGRATION.md).
 
 ## API Endpoints
 
@@ -289,10 +305,14 @@ Compatibility fallbacks:
 ## Scripts
 
 ```bash
-npm run dev      # Start Next.js in development mode
-npm run build    # Build Next.js
-npm run start    # Start Next.js production server
-npm run lint     # Run ESLint
+npm --prefix frontend run dev      # Start Next.js in development mode
+npm --prefix frontend run build    # Build Next.js
+npm --prefix frontend run start    # Start Next.js production server
+npm --prefix frontend run lint     # Run ESLint
+infra/scripts/deploy_gcp.sh        # Deploy GCP Cloud Run + Firebase Hosting
+infra/scripts/destroy_gcp.sh       # Destroy GCP Terraform resources
+infra/scripts/deploy_aws.sh        # Deploy AWS App Runner
+infra/scripts/destroy_aws.sh       # Destroy AWS Terraform resources
 ```
 
 ## Disclaimer
